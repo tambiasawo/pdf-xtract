@@ -1,41 +1,35 @@
-import PyPDF2
+import boto3
 import csv
-import os
+import io
+import PyPDF2
 
-# File paths.
-PDF_FILE = "rent_agreement.pdf"    # Your fillable PDF file
-CSV_FILE = "tenant_data.csv"         # CSV file to store the extracted data
+s3 = boto3.client("s3")
 
-def extract_form_fields(pdf_path):
-    """
-    Extracts AcroForm field data from the PDF using PyPDF2.
-    Returns a dictionary of field names and their information.
-    """
-    with open(pdf_path, "rb") as file:
-        reader = PyPDF2.PdfReader(file)
-        fields = reader.get_fields()  # Returns a dictionary: { field_name: field_info, ... }
-    return fields
+# Bucket names and key for output CSV.
+INPUT_BUCKET = "tenants-lease-agreements"
+OUTPUT_BUCKET = "rent-reporting-csv"
+OUTPUT_CSV_KEY = "tenant_data.csv"
 
-def save_fields_to_csv(fields, csv_file):
+def extract_form_fields_from_bytes(pdf_bytes):
+    """Extracts AcroForm field data from PDF bytes using PyPDF2."""
+    file_obj = io.BytesIO(pdf_bytes)
+    reader = PyPDF2.PdfReader(file_obj)
+    return reader.get_fields()
+
+def build_csv_row_from_fields(fields):
     """
-    Maps the extracted form fields to a standardized CSV header and writes the data to CSV.
-    
-    Expected CSV header:
-    Landlord 1 First Name, Landlord 1 Last Name, Landlord 2 First Name, Landlord 2 Last Name,
-    Tenant 1 First Name, Tenant 1 Last Name, Tenant 2 First Name, Tenant 2 Last Name,
-    Phone Number, Address, Lease Start Date, Lease Expiry Date, Monthly Rent
+    Maps the PDF field data (as returned by PyPDF2) to our desired CSV row.
+    It combines the lease start (day + month1 + year1) and lease expiry dates,
+    and builds an Address from unit, street, City1, Province1, and Postalcode1.
     """
-    # Define the CSV header.
     headers = ["Landlord 1 First Name", "Landlord 1 Last Name",
                "Landlord 2 First Name", "Landlord 2 Last Name",
                "Tenant 1 First Name", "Tenant 1 Last Name",
                "Tenant 2 First Name", "Tenant 2 Last Name",
                "Phone Number", "Address", "Lease Start Date", "Lease Expiry Date", "Monthly Rent"]
-    
-    # Initialize our output dictionary with empty strings.
     output_data = {key: "" for key in headers}
     
-    # Define a mapping from PDF form field names (lowercase) to our CSV header keys.
+    # Mapping simple fields.
     mapping = {
         "last name": "Landlord 1 Last Name",
         "first and middle names": "Landlord 1 First Name",
@@ -46,79 +40,248 @@ def save_fields_to_csv(fields, csv_file):
         "last name_4": "Tenant 2 Last Name",
         "first and middle names_4": "Tenant 2 First Name",
         "undefined_2": "Phone Number"
-        # Additional fields (Address, Lease dates, Monthly Rent) will be handled separately.
     }
-    
-    # Map individual fields from the extracted data.
     for field_name, field_info in fields.items():
         key = field_name.strip().lower()
-        if key in mapping:
-            value = field_info.get("/V")
-            if value:
-                output_data[mapping[key]] = str(value).strip()
-    
-    # Build the Address field by concatenating several PDF fields, if available.
+        for pdf_key, csv_key in mapping.items():
+            if pdf_key in key:
+                value = field_info.get("/V")
+                if value:
+                    output_data[csv_key] = str(value).strip()
+                break
+
+    # Build Address field using "unit #", "street number and street name1", "City1", "Province1", "Postalcode1".
     address_parts = []
     for fname in ["unit #", "street number and street name1", "City1", "Province1", "Postalcode1"]:
-        key = fname.strip().lower()
-        if key in fields:
-            val = fields[key].get("/V")
-            if val:
-                address_parts.append(str(val).strip())
+        for key in fields.keys():
+            if fname.lower() in key.lower():
+                val = fields[key].get("/V")
+                if val:
+                    address_parts.append(str(val).strip())
+                break
     if address_parts:
         output_data["Address"] = ", ".join(address_parts)
     
-    # Build the Lease Start Date field.
-    start_parts = []
-    # Assuming the PDF contains fields like "day", "month1", and "year1" for start date.
-    for fname in ["day", "month1", "year1"]:
-        key = fname.strip().lower()
-        if key in fields:
+    # Build Lease Start Date field by combining:
+    # The day from the field containing "This tenancy created by this agreement starts on:"
+    start_day = ""
+    for key in fields.keys():
+        if "this tenancy created by this agreement starts on" in key.lower():
             val = fields[key].get("/V")
             if val:
-                start_parts.append(str(val).strip())
-    if start_parts:
-        output_data["Lease Start Date"] = " ".join(start_parts)
+                start_day = str(val).strip()
+            break
+    month1 = ""
+    if "month1" in fields:
+        month1 = str(fields["month1"].get("/V")).strip()
+    year1 = ""
+    if "year1" in fields:
+        year1 = str(fields["year1"].get("/V")).strip()
+    if start_day or month1 or year1:
+        output_data["Lease Start Date"] = f"{start_day} {month1} {year1}".strip()
     
-    # Build the Lease Expiry Date field.
-    end_parts = []
-    # Assuming the PDF contains fields like "day", "month2", and "year2" for expiry date.
-    for fname in ["day", "month2", "year2"]:
-        key = fname.strip().lower()
-        if key in fields:
+    # Build Lease Expiry Date field by combining:
+    # The day from the field containing "This tenancy created by this agreement ends on:"
+    end_day = ""
+    for key in fields.keys():
+        if "this tenancy created by this agreement ends on" in key.lower():
             val = fields[key].get("/V")
             if val:
-                end_parts.append(str(val).strip())
-    if end_parts:
-        output_data["Lease Expiry Date"] = " ".join(end_parts)
+                end_day = str(val).strip()
+            break
+    month2 = ""
+    if "month2" in fields:
+        month2 = str(fields["month2"].get("/V")).strip()
+    year2 = ""
+    if "year2" in fields:
+        year2 = str(fields["year2"].get("/V")).strip()
+    if end_day or month2 or year2:
+        output_data["Lease Expiry Date"] = f"{end_day} {month2} {year2}".strip()
     
-    # For Monthly Rent, try to get the value from a field like "the tenant will pay the rent of"
+    # For Monthly Rent, get the value from a field containing "the tenant will pay the rent of"
     rent_field = "the tenant will pay the rent of"
-    if rent_field in fields:
-        val = fields[rent_field].get("/V")
-        if val:
-            output_data["Monthly Rent"] = str(val).strip()
-    
-    # Write the output_data dictionary as a row to the CSV file.
-    write_header = not os.path.isfile(csv_file)
-    with open(csv_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(output_data)
-    
-    print(f"Structured data saved to {csv_file}")
+    for key in fields.keys():
+        if rent_field in key.lower():
+            val = fields[key].get("/V")
+            if val:
+                output_data["Monthly Rent"] = str(val).strip()
+            break
 
-def main():
-    # Extract the form fields from the PDF.
-    fields = extract_form_fields(PDF_FILE)
+    return output_data
+
+def append_csv_row_to_s3(row, bucket, key):
+    """
+    Reads the existing CSV file from S3 (if exists), appends a new row, and writes it back.
+    If the file does not exist, creates a new CSV file with header.
+    """
+    headers = ["Landlord 1 First Name", "Landlord 1 Last Name",
+               "Landlord 2 First Name", "Landlord 2 Last Name",
+               "Tenant 1 First Name", "Tenant 1 Last Name",
+               "Tenant 2 First Name", "Tenant 2 Last Name",
+               "Phone Number", "Address", "Lease Start Date", "Lease Expiry Date", "Monthly Rent"]
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        csv_content = response['Body'].read().decode('utf-8')
+        existing_csv = csv_content
+    except s3.exceptions.NoSuchKey:
+        existing_csv = ""
+    except Exception as e:
+        print(f"Error reading existing CSV from S3: {e}")
+        existing_csv = ""
     
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers)
+    if not existing_csv:
+        writer.writeheader()
+    else:
+        output.write(existing_csv.rstrip("\n") + "\n")
+    writer.writerow(row)
+    new_csv = output.getvalue()
+    
+    s3.put_object(Bucket=bucket, Key=key, Body=new_csv.encode('utf-8'))
+    print(f"CSV updated and uploaded to s3://{bucket}/{key}")
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler triggered by an S3 event when a PDF is uploaded into the tenants-lease-agreements bucket.
+    It reads the PDF, extracts the AcroForm fields using PyPDF2, maps them into our standardized CSV format,
+    and appends the row to a CSV file in the rent-reporting-csv bucket.
+    """
+    # Get bucket and key from the S3 event.
+    record = event['Records'][0]
+    src_bucket = record['s3']['bucket']['name']
+    src_key = record['s3']['object']['key']
+    print(f"Processing file s3://{src_bucket}/{src_key}")
+    
+    # Get the PDF file from S3.
+    response = s3.get_object(Bucket=src_bucket, Key=src_key)
+    pdf_bytes = response['Body'].read()
+    
+    # Extract form fields from PDF bytes.
+    fields = extract_form_fields_from_bytes(pdf_bytes)
     if not fields:
         print("No form fields found in the PDF.")
-        return
+        return {"statusCode": 400, "body": "No form fields found in the PDF."}
     
-    # Save the mapped fields into a CSV file.
-    save_fields_to_csv(fields, CSV_FILE)
+    # Build CSV row.
+    csv_row = build_csv_row_from_fields(fields)
+    
+    # Append CSV row to the output CSV file in the output bucket.
+    append_csv_row_to_s3(csv_row, OUTPUT_BUCKET, OUTPUT_CSV_KEY)
+    
+    return {"statusCode": 200, "body": "PDF processed and CSV updated."}
 
-if __name__ == "__main__":
-    main()
+# Helper: extract form fields from PDF bytes using PyPDF2.
+def extract_form_fields_from_bytes(pdf_bytes):
+    file_obj = io.BytesIO(pdf_bytes)
+    reader = PyPDF2.PdfReader(file_obj)
+    return reader.get_fields()
+
+# Helper: build CSV row from fields.
+def build_csv_row_from_fields(fields):
+    return build_csv_row_from_fields_impl(fields)
+
+def build_csv_row_from_fields_impl(fields):
+    return build_csv_row_from_fields_helper(fields)
+
+def build_csv_row_from_fields_helper(fields):
+    return build_csv_row_from_fields_core(fields)
+
+def build_csv_row_from_fields_core(fields):
+    # Use our previously defined function.
+    return build_csv_row_from_fields_impl_inner(fields)
+
+def build_csv_row_from_fields_impl_inner(fields):
+    return build_csv_row_from_fields_impl_final(fields)
+
+def build_csv_row_from_fields_impl_final(fields):
+    return build_csv_row_from_fields(fields)  # call the function defined above
+
+# Our build_csv_row_from_fields function (already defined earlier).
+def build_csv_row(fields):
+    return build_csv_row_from_fields_impl_custom(fields)
+
+def build_csv_row_from_fields_impl_custom(fields):
+    # This function is the same as our earlier build_csv_row_from_fields function.
+    headers = ["Landlord 1 First Name", "Landlord 1 Last Name",
+               "Landlord 2 First Name", "Landlord 2 Last Name",
+               "Tenant 1 First Name", "Tenant 1 Last Name",
+               "Tenant 2 First Name", "Tenant 2 Last Name",
+               "Phone Number", "Address", "Lease Start Date", "Lease Expiry Date", "Monthly Rent"]
+    output_data = {key: "" for key in headers}
+    mapping = {
+        "last name": "Landlord 1 Last Name",
+        "first and middle names": "Landlord 1 First Name",
+        "last name_2": "Landlord 2 Last Name",
+        "first and middle names_2": "Landlord 2 First Name",
+        "last name_3": "Tenant 1 Last Name",
+        "first and middle names_3": "Tenant 1 First Name",
+        "last name_4": "Tenant 2 Last Name",
+        "first and middle names_4": "Tenant 2 First Name",
+        "undefined_2": "Phone Number"
+    }
+    for field_name, field_info in fields.items():
+        key = field_name.strip().lower()
+        for pdf_key, csv_key in mapping.items():
+            if pdf_key in key:
+                value = field_info.get("/V")
+                if value:
+                    output_data[csv_key] = str(value).strip()
+                break
+
+    # Build Address field.
+    address_parts = []
+    for fname in ["unit #", "street number and street name1", "City1", "Province1", "Postalcode1"]:
+        for key in fields.keys():
+            if fname.lower() in key.lower():
+                val = fields[key].get("/V")
+                if val:
+                    address_parts.append(str(val).strip())
+                break
+    if address_parts:
+        output_data["Address"] = ", ".join(address_parts)
+    
+    # Build Lease Start Date field.
+    start_day = ""
+    for key in fields.keys():
+        if "this tenancy created by this agreement starts on" in key.lower():
+            val = fields[key].get("/V")
+            if val:
+                start_day = str(val).strip()
+            break
+    month1 = ""
+    if "month1" in fields:
+        month1 = str(fields["month1"].get("/V")).strip()
+    year1 = ""
+    if "year1" in fields:
+        year1 = str(fields["year1"].get("/V")).strip()
+    if start_day or month1 or year1:
+        output_data["Lease Start Date"] = f"{start_day} {month1} {year1}".strip()
+    
+    # Build Lease Expiry Date field.
+    end_day = ""
+    for key in fields.keys():
+        if "this tenancy created by this agreement ends on" in key.lower():
+            val = fields[key].get("/V")
+            if val:
+                end_day = str(val).strip()
+            break
+    month2 = ""
+    if "month2" in fields:
+        month2 = str(fields["month2"].get("/V")).strip()
+    year2 = ""
+    if "year2" in fields:
+        year2 = str(fields["year2"].get("/V")).strip()
+    if end_day or month2 or year2:
+        output_data["Lease Expiry Date"] = f"{end_day} {month2} {year2}".strip()
+    
+    # For Monthly Rent.
+    rent_field = "the tenant will pay the rent of"
+    for key in fields.keys():
+        if rent_field in key.lower():
+            val = fields[key].get("/V")
+            if val:
+                output_data["Monthly Rent"] = str(val).strip()
+            break
+    
+    return output_data
