@@ -44,13 +44,12 @@ def build_csv_row_from_fields(fields):
     
     # Populate the simple fields via mapping
     for field_name, field_info in fields.items():
-        key_lower = field_name.strip().lower()
-        for pdf_key, csv_key in mapping.items():
-            if pdf_key in key_lower:
-                value = field_info.get("/V")
-                if value:
-                    output_data[csv_key] = str(value).strip()
-                break
+        key = field_name.strip().lower()
+        if key in mapping:
+            value = field_info.get("/V")
+            if value:
+                output_data[mapping[key]] = str(value).strip()
+    
 
     # Build Address field (unit #, street name, city, province, postal code)
     address_parts = []
